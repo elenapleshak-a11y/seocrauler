@@ -1,45 +1,46 @@
 class WebCrawler {
     constructor() {
         this.crawledUrls = new Set();
+        this.urlsToCrawl = new Set();
         this.isCrawling = false;
         this.startTime = null;
-        this.totalUrls = 0;
         this.processedUrls = 0;
+        this.maxPages = 200; // Увеличиваем лимит
     }
 
     async startCrawling() {
         const urlInput = document.getElementById('urlInput').value.trim();
         const errorDiv = document.getElementById('error');
         
-        // Валидация URL
         if (!urlInput) {
             this.showError('Пожалуйста, введите URL');
             return;
         }
         
         if (!this.isValidUrl(urlInput)) {
-            this.showError('Пожалуйста, введите корректный URL (начинается с http:// или https://)');
+            this.showError('Пожалуйста, введите корректный URL');
             return;
         }
 
         // Сброс состояния
         errorDiv.textContent = '';
         this.crawledUrls.clear();
+        this.urlsToCrawl.clear();
         this.isCrawling = true;
         this.startTime = Date.now();
         this.processedUrls = 0;
         
-        // Показать прогресс
         this.showProgress();
-        
-        // Заблокировать кнопку
         document.getElementById('crawlBtn').disabled = true;
         
         try {
-            // Начать краулинг с корневой страницы
-            await this.crawlPage(urlInput, urlInput);
+            // Добавляем начальный URL
+            const baseUrl = this.normalizeUrl(urlInput);
+            this.urlsToCrawl.add(baseUrl);
             
-            // Показать результат
+            // Запускаем краулинг
+            await this.crawlAllPages(baseUrl);
+            
             this.showResult();
         } catch (error) {
             this.showError('Ошибка при краулинге: ' + error.message);
@@ -49,76 +50,145 @@ class WebCrawler {
         }
     }
 
-    async crawlPage(url, baseUrl) {
-        // Проверяем, не посещали ли мы уже эту страницу
-        if (this.crawledUrls.has(url)) {
-            return;
+    async crawlAllPages(baseUrl) {
+        while (this.urlsToCrawl.size > 0 && this.isCrawling && this.crawledUrls.size < this.maxPages) {
+            const currentUrl = Array.from(this.urlsToCrawl)[0];
+            this.urlsToCrawl.delete(currentUrl);
+            
+            if (!this.crawledUrls.has(currentUrl)) {
+                await this.crawlSinglePage(currentUrl, baseUrl);
+                this.processedUrls++;
+                this.updateProgress();
+                
+                // Небольшая пауза между запросами
+                await this.delay(200);
+            }
         }
+    }
 
-        // Добавляем URL в список обработанных
+    async crawlSinglePage(url, baseUrl) {
+        if (this.crawledUrls.has(url)) return;
+        
         this.crawledUrls.add(url);
-        this.processedUrls++;
-        this.updateProgress();
-
+        
         try {
-            // Используем CORS proxy для обхода ограничений браузера
-            const proxyUrl = 'https://cors-anywhere.herokuapp.com/';
-            const response = await fetch(proxyUrl + url, {
-                method: 'GET',
-                headers: {
-                    'X-Requested-With': 'XMLHttpRequest'
-                }
-            });
-
-            if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
+            console.log('Crawling:', url);
+            
+            // Пробуем разные подходы для обхода CORS
+            const html = await this.fetchWithFallback(url);
+            
+            if (html) {
+                const newUrls = this.extractUrlsFromHtml(html, baseUrl);
+                this.addNewUrlsToCrawl(newUrls, baseUrl);
             }
+        } catch (error) {
+            console.warn(`Не удалось обработать ${url}:`, error);
+        }
+    }
 
-            const html = await response.text();
+    async fetchWithFallback(url) {
+        const proxies = [
+            `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+            `https://corsproxy.io/?${encodeURIComponent(url)}`,
+            `https://proxy.cors.sh/${url}`,
+            url // Прямой запрос (может не сработать из-за CORS)
+        ];
+
+        for (const proxyUrl of proxies) {
+            try {
+                const response = await fetch(proxyUrl, {
+                    method: 'GET',
+                    headers: {
+                        'Accept': 'text/html,application/xhtml+xml,application/xml',
+                        'User-Agent': 'Mozilla/5.0 (compatible; WebCrawler/1.0)'
+                    },
+                    timeout: 10000
+                });
+
+                if (response.ok) {
+                    return await response.text();
+                }
+            } catch (error) {
+                console.log(`Proxy ${proxyUrl} failed:`, error);
+                continue;
+            }
+        }
+        
+        throw new Error('All proxies failed');
+    }
+
+    extractUrlsFromHtml(html, baseUrl) {
+        const urls = new Set();
+        
+        try {
+            // Простой парсинг HTML с помощью регулярных выражений
+            // Более надежный способ извлечения ссылок
+            const linkRegex = /<a\s+(?:[^>]*?\s+)?href=(["'])(.*?)\1/gi;
+            let match;
             
-            // Парсим HTML и извлекаем ссылки
-            const parser = new DOMParser();
-            const doc = parser.parseFromString(html, 'text/html');
-            const links = doc.querySelectorAll('a[href]');
-            
-            const foundUrls = [];
-            
-            for (const link of links) {
-                const href = link.getAttribute('href');
-                const absoluteUrl = this.getAbsoluteUrl(href, baseUrl);
-                
-                // Фильтруем только ссылки на том же домене
-                if (this.isSameDomain(absoluteUrl, baseUrl) && 
-                    this.isValidPageUrl(absoluteUrl)) {
-                    foundUrls.push(absoluteUrl);
+            while ((match = linkRegex.exec(html)) !== null) {
+                const href = match[2];
+                if (href) {
+                    const absoluteUrl = this.getAbsoluteUrl(href, baseUrl);
+                    if (this.isValidUrl(absoluteUrl)) {
+                        urls.add(absoluteUrl);
+                    }
                 }
             }
             
-            // Убираем дубликаты
-            const uniqueUrls = [...new Set(foundUrls)];
-            this.totalUrls = uniqueUrls.length;
-            
-            // Рекурсивно обходим найденные ссылки (ограничиваем глубину для демонстрации)
-            for (const foundUrl of uniqueUrls) {
-                if (!this.isCrawling) break; // Останавливаемся если пользователь прервал
-                
-                if (!this.crawledUrls.has(foundUrl) && this.crawledUrls.size < 50) {
-                    // Небольшая задержка чтобы не перегружать сервер
-                    await this.delay(100);
-                    await this.crawlPage(foundUrl, baseUrl);
+            // Дополнительно ищем ссылки в других тегах
+            const srcRegex = /<(?:link|img|script)\s+(?:[^>]*?\s+)?(?:href|src)=(["'])(.*?)\1/gi;
+            while ((match = srcRegex.exec(html)) !== null) {
+                const src = match[2];
+                if (src) {
+                    const absoluteUrl = this.getAbsoluteUrl(src, baseUrl);
+                    if (this.isValidUrl(absoluteUrl)) {
+                        urls.add(absoluteUrl);
+                    }
                 }
             }
             
         } catch (error) {
-            console.warn(`Не удалось обработать страницу ${url}:`, error);
+            console.error('Error parsing HTML:', error);
         }
+        
+        return Array.from(urls);
+    }
+
+    addNewUrlsToCrawl(newUrls, baseUrl) {
+        newUrls.forEach(url => {
+            const normalizedUrl = this.normalizeUrl(url);
+            
+            if (this.isSameDomain(normalizedUrl, baseUrl) &&
+                this.isValidPageUrl(normalizedUrl) &&
+                !this.crawledUrls.has(normalizedUrl) &&
+                !this.urlsToCrawl.has(normalizedUrl) &&
+                this.crawledUrls.size < this.maxPages) {
+                
+                this.urlsToCrawl.add(normalizedUrl);
+            }
+        });
     }
 
     getAbsoluteUrl(href, baseUrl) {
         try {
-            return new URL(href, baseUrl).href;
+            // Убираем якоря и параметры запроса для нормализации
+            const url = new URL(href, baseUrl);
+            url.hash = ''; // Убираем якоря
+            return url.href;
         } catch (error) {
             return href;
+        }
+    }
+
+    normalizeUrl(url) {
+        try {
+            const urlObj = new URL(url);
+            urlObj.hash = '';
+            // Приводим к нижнему регистру для единообразия
+            return urlObj.href.toLowerCase();
+        } catch (error) {
+            return url;
         }
     }
 
@@ -133,12 +203,38 @@ class WebCrawler {
     }
 
     isValidPageUrl(url) {
-        // Исключаем ссылки на файлы, якоря и т.д.
-        const excludedExtensions = ['.pdf', '.jpg', '.jpeg', '.png', '.gif', '.zip', '.rar', '.exe'];
-        return !excludedExtensions.some(ext => url.toLowerCase().includes(ext)) &&
-               !url.includes('#') &&
-               !url.includes('mailto:') &&
-               !url.includes('tel:');
+        try {
+            const urlObj = new URL(url);
+            
+            // Исключаем файлы
+            const excludedExtensions = [
+                '.pdf', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp',
+                '.zip', '.rar', '.7z', '.tar', '.gz',
+                '.exe', '.dmg', '.pkg',
+                '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+                '.mp4', '.avi', '.mov', '.wmv',
+                '.mp3', '.wav', '.ogg'
+            ];
+            
+            const pathname = urlObj.pathname.toLowerCase();
+            if (excludedExtensions.some(ext => pathname.endsWith(ext))) {
+                return false;
+            }
+            
+            // Исключаем почту, телефон и т.д.
+            if (url.startsWith('mailto:') || 
+                url.startsWith('tel:') || 
+                url.startsWith('javascript:') ||
+                url.startsWith('ftp:')) {
+                return false;
+            }
+            
+            // Включаем только HTTP/HTTPS
+            return urlObj.protocol === 'http:' || urlObj.protocol === 'https:';
+            
+        } catch (error) {
+            return false;
+        }
     }
 
     isValidUrl(string) {
@@ -161,11 +257,15 @@ class WebCrawler {
         const progressFill = document.getElementById('progressFill');
         const progressInfo = document.getElementById('progressInfo');
         
-        const progress = this.processedUrls / Math.max(this.totalUrls, 1) * 100;
+        const progress = (this.processedUrls / Math.max(this.processedUrls + this.urlsToCrawl.size, 1)) * 100;
         progressFill.style.width = Math.min(progress, 100) + '%';
         
         const elapsedTime = (Date.now() - this.startTime) / 1000;
-        progressInfo.textContent = `Обработано: ${this.processedUrls} страниц | Время: ${elapsedTime.toFixed(1)}с`;
+        const foundCount = this.crawledUrls.size;
+        const remaining = this.urlsToCrawl.size;
+        
+        progressInfo.textContent = 
+            `Найдено: ${foundCount} | В очереди: ${remaining} | Время: ${elapsedTime.toFixed(1)}с`;
     }
 
     showResult() {
@@ -175,6 +275,9 @@ class WebCrawler {
         urlCount.textContent = this.crawledUrls.size;
         resultDiv.style.display = 'block';
         document.getElementById('progressContainer').style.display = 'none';
+        
+        // Показываем список URL в консоли для отладки
+        console.log('Found URLs:', Array.from(this.crawledUrls));
     }
 
     showError(message) {
@@ -192,25 +295,33 @@ class WebCrawler {
             return;
         }
 
-        const csvContent = Array.from(this.crawledUrls).join('\n');
+        // Сортируем URL для удобства
+        const sortedUrls = Array.from(this.crawledUrls).sort();
+        const csvContent = ['URL', ...sortedUrls].join('\n');
+        
         const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
         const link = document.createElement('a');
         
         const url = URL.createObjectURL(blob);
         link.setAttribute('href', url);
-        link.setAttribute('download', 'crawled_pages.csv');
+        link.setAttribute('download', `crawled_pages_${new Date().toISOString().split('T')[0]}.csv`);
         link.style.visibility = 'hidden';
         
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
     }
+
+    // Метод для остановки краулинга
+    stopCrawling() {
+        this.isCrawling = false;
+        document.getElementById('crawlBtn').disabled = false;
+        document.getElementById('progressContainer').style.display = 'none';
+    }
 }
 
-// Создаем экземпляр краулера
 const crawler = new WebCrawler();
 
-// Глобальные функции для вызова из HTML
 function startCrawling() {
     crawler.startCrawling();
 }
@@ -219,9 +330,14 @@ function downloadCSV() {
     crawler.downloadCSV();
 }
 
-// Обработка ввода URL
-document.getElementById('urlInput').addEventListener('keypress', function(e) {
-    if (e.key === 'Enter') {
-        startCrawling();
-    }
+// Добавляем кнопку остановки
+document.addEventListener('DOMContentLoaded', function() {
+    const crawlBtn = document.getElementById('crawlBtn');
+    const originalText = crawlBtn.textContent;
+    
+    document.getElementById('urlInput').addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') {
+            startCrawling();
+        }
+    });
 });
